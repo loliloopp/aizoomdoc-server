@@ -4,16 +4,21 @@ API роутер для работы с чатами.
 
 import logging
 from uuid import UUID
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
+from typing import List, Optional, AsyncGenerator
+from fastapi import APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import StreamingResponse
 
-from app.core.dependencies import get_current_user_id
+from app.core.dependencies import get_current_user_id, get_current_user
 from app.db.supabase_client import SupabaseClient
+from app.db.supabase_projects_client import SupabaseProjectsClient
+from app.db.s3_client import S3Client
+from app.services.agent_service import AgentService
 from app.models.api import (
     ChatCreate,
     ChatResponse,
     MessageCreate,
     MessageResponse,
+    MessageImage,
     ChatHistoryResponse
 )
 
@@ -135,6 +140,51 @@ async def get_chat_history(
     # Получаем сообщения
     messages = await supabase.get_chat_messages(chat_id)
     
+    # Получаем изображения для каждого сообщения
+    from app.config import settings
+    
+    message_responses = []
+    for msg in messages:
+        images_data = await supabase.get_message_images(msg.id)
+        
+        images = []
+        for img in images_data:
+            # Генерируем URL для изображения
+            storage_path = img.get("storage_path")
+            external_url = img.get("external_url")
+            
+            if external_url:
+                url = external_url
+            elif storage_path and settings.use_s3_dev_url and settings.s3_dev_url:
+                # Приоритет на S3_DEV_URL если включён
+                base_url = settings.s3_dev_url.rstrip('/')
+                url = f"{base_url}/{storage_path}"
+            elif storage_path and settings.r2_public_domain:
+                domain = settings.r2_public_domain.replace('https://', '').replace('http://', '')
+                url = f"https://{domain}/{storage_path}"
+            else:
+                url = None
+            
+            images.append(MessageImage(
+                id=img.get("id"),
+                file_id=img.get("file_id"),
+                image_type=img.get("image_type"),
+                description=img.get("description"),
+                width=img.get("width"),
+                height=img.get("height"),
+                url=url
+            ))
+        
+        message_responses.append(MessageResponse(
+            id=msg.id,
+            chat_id=msg.chat_id,
+            role=msg.role,
+            content=msg.content,
+            message_type=msg.message_type,
+            created_at=msg.created_at,
+            images=images
+        ))
+    
     return ChatHistoryResponse(
         chat=ChatResponse(
             id=chat.id,
@@ -144,17 +194,7 @@ async def get_chat_history(
             created_at=chat.created_at,
             updated_at=chat.updated_at
         ),
-        messages=[
-            MessageResponse(
-                id=msg.id,
-                chat_id=msg.chat_id,
-                role=msg.role,
-                content=msg.content,
-                message_type=msg.message_type,
-                created_at=msg.created_at
-            )
-            for msg in messages
-        ]
+        messages=message_responses
     )
 
 
@@ -205,6 +245,8 @@ async def send_message(
         role="user",
         content=message_data.content
     )
+
+    # TODO: сохранить attached_file_ids / attached_document_ids при необходимости
     
     if not message:
         raise HTTPException(
@@ -220,6 +262,43 @@ async def send_message(
         message_type=message.message_type,
         created_at=message.created_at
     )
+
+
+@router.get("/{chat_id}/stream")
+async def chat_stream_sse(
+    chat_id: UUID,
+    client_id: Optional[str] = Query(default=None, description="ID клиента (projects)"),
+    document_ids: Optional[List[UUID]] = Query(default=None, description="ID документов для контекста"),
+    current_user=Depends(get_current_user),
+    supabase: SupabaseClient = Depends(),
+    projects_db: SupabaseProjectsClient = Depends(),
+):
+    """
+    SSE стрим обработки сообщения.
+    Ожидает, что сообщение пользователя уже сохранено через POST /chats/{chat_id}/messages.
+    """
+    s3_client = S3Client()
+    agent = AgentService(current_user, supabase, projects_db, s3_client)
+
+    # Получаем последнее сообщение пользователя
+    last_user_message = await supabase.get_last_message(chat_id, role="user")
+    if not last_user_message:
+        raise HTTPException(status_code=404, detail="User message not found")
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        async for event in agent.process_message(
+            chat_id=chat_id,
+            user_message=last_user_message.content,
+            client_id=client_id,
+            document_ids=document_ids,
+            save_user_message=False
+        ):
+            import json
+            payload = json.dumps(event.data, ensure_ascii=False)
+            yield f"event: {event.event}\n"
+            yield f"data: {payload}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.websocket("/{chat_id}/stream")

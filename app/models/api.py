@@ -117,6 +117,21 @@ class MessageCreate(BaseModel):
         default=None,
         description="ID прикрепленных файлов"
     )
+    attached_document_ids: Optional[List[UUID]] = Field(
+        default=None,
+        description="ID документов из дерева (projects DB)"
+    )
+
+
+class MessageImage(BaseModel):
+    """Изображение в сообщении."""
+    id: UUID
+    file_id: Optional[UUID] = None
+    image_type: Optional[str] = None
+    description: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    url: Optional[str] = None  # URL для доступа к изображению
 
 
 class MessageResponse(BaseModel):
@@ -127,6 +142,7 @@ class MessageResponse(BaseModel):
     content: str
     message_type: str = Field(default="text")
     created_at: datetime
+    images: List[MessageImage] = Field(default_factory=list)
 
 
 class ChatHistoryResponse(BaseModel):

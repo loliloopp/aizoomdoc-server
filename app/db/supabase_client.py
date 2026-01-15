@@ -427,6 +427,93 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Error getting chat messages: {e}")
             return []
+
+    async def get_last_message(
+        self,
+        chat_id: UUID,
+        role: Optional[str] = None
+    ) -> Optional[Message]:
+        """Получить последнее сообщение в чате (опционально по роли)."""
+        try:
+            query = (
+                self.client.table("chat_messages")
+                .select("*")
+                .eq("chat_id", str(chat_id))
+                .order("created_at", desc=True)
+                .limit(1)
+            )
+            if role:
+                query = query.eq("role", role)
+
+            response = query.execute()
+            if response.data:
+                return Message(**response.data[0])
+            return None
+        except Exception as e:
+            logger.error(f"Error getting last message: {e}")
+            return None
+    
+    async def get_message_images(self, message_id: UUID) -> List[dict]:
+        """Получить изображения сообщения."""
+        try:
+            # Получаем chat_images с join на storage_files
+            response = (
+                self.client.table("chat_images")
+                .select("*, storage_files(*)")
+                .eq("message_id", str(message_id))
+                .execute()
+            )
+            
+            images = []
+            for item in response.data:
+                storage_file = item.get("storage_files", {})
+                images.append({
+                    "id": item.get("id"),
+                    "message_id": item.get("message_id"),
+                    "file_id": item.get("file_id"),
+                    "image_type": item.get("image_type"),
+                    "description": item.get("description"),
+                    "width": item.get("width"),
+                    "height": item.get("height"),
+                    "storage_path": storage_file.get("storage_path") if storage_file else None,
+                    "external_url": storage_file.get("external_url") if storage_file else None,
+                    "filename": storage_file.get("filename") if storage_file else None,
+                })
+            
+            return images
+        
+        except Exception as e:
+            logger.error(f"Error getting message images: {e}")
+            return []
+
+    async def add_chat_image(
+        self,
+        chat_id: UUID,
+        message_id: UUID,
+        file_id: Optional[UUID],
+        image_type: Optional[str] = None,
+        description: Optional[str] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None
+    ) -> Optional[ChatImage]:
+        """Добавить изображение к сообщению."""
+        try:
+            data = {
+                "chat_id": str(chat_id),
+                "message_id": str(message_id),
+                "file_id": str(file_id) if file_id else None,
+                "image_type": image_type,
+                "description": description,
+                "width": width,
+                "height": height
+            }
+            response = self.client.table("chat_images").insert(data).execute()
+            if response.data:
+                return ChatImage(**response.data[0])
+            return None
+        except Exception as e:
+            logger.error(f"Error adding chat image: {e}")
+            return None
     
     # ===== FILE METHODS =====
     

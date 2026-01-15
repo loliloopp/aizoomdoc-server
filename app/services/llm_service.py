@@ -212,10 +212,39 @@ class LLMService:
         Returns:
             Список tool calls
         """
-        # TODO: Реализовать парсинг JSON из ответа
-        # Использовать extract_json_objects из исходного llm_client.py
-        
-        return []
+        import json
+
+        def extract_json_objects(text: str) -> List[Any]:
+            results = []
+            decoder = json.JSONDecoder()
+            pos = 0
+            length = len(text)
+
+            while pos < length:
+                idx_brace = text.find("{", pos)
+                if idx_brace == -1:
+                    break
+                try:
+                    obj, end_idx = decoder.raw_decode(text[idx_brace:])
+                    results.append(obj)
+                    pos = idx_brace + end_idx
+                except json.JSONDecodeError:
+                    pos = idx_brace + 1
+            return results
+
+        objs = extract_json_objects(response_text)
+        tool_calls: List[Dict[str, Any]] = []
+
+        for obj in objs:
+            if isinstance(obj, dict):
+                if "tool" in obj:
+                    tool_calls.append(obj)
+                elif "tool_calls" in obj and isinstance(obj["tool_calls"], list):
+                    for tc in obj["tool_calls"]:
+                        if isinstance(tc, dict) and "tool" in tc:
+                            tool_calls.append(tc)
+
+        return tool_calls
 
 
 def create_llm_service(user: UserWithSettings) -> LLMService:

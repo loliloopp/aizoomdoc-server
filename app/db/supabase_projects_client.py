@@ -135,6 +135,21 @@ class SupabaseProjectsClient:
         except Exception as e:
             logger.error(f"Error getting document results: {e}")
             return []
+
+    async def get_document_crops(self, document_node_id: UUID) -> List[dict]:
+        """Получить кропы (изображения) документа."""
+        try:
+            response = (
+                self.client.table("node_files")
+                .select("*")
+                .eq("node_id", str(document_node_id))
+                .eq("file_type", "crop")
+                .execute()
+            )
+            return response.data
+        except Exception as e:
+            logger.error(f"Error getting document crops: {e}")
+            return []
     
     async def search_documents(
         self,
