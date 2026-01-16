@@ -61,6 +61,8 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("GOOGLE_API_KEY", "DEFAULT_GEMINI_API_KEY")
     )
     default_model: str = Field(default="gemini-3-flash-preview", alias="DEFAULT_MODEL")
+    default_flash_model: str = Field(default="gemini-3-flash-preview", alias="DEFAULT_FLASH_MODEL")
+    default_pro_model: str = Field(default="gemini-3-pro-preview", alias="DEFAULT_PRO_MODEL")
     max_tokens: int = Field(default=15000, alias="MAX_TOKENS")
     llm_temperature: float = Field(default=1.0, alias="LLM_TEMPERATURE")
     llm_top_p: float = Field(default=0.95, alias="LLM_TOP_P")
@@ -76,6 +78,11 @@ class Settings(BaseSettings):
     auto_quadrants_threshold: float = Field(default=2.5, alias="AUTO_QUADRANTS_THRESHOLD")
     viewport_size: int = Field(default=2048, alias="VIEWPORT_SIZE")
     viewport_padding: int = Field(default=512, alias="VIEWPORT_PADDING")
+
+    # Local LLM logging
+    llm_log_enabled: bool = Field(default=True, alias="LLM_LOG_ENABLED")
+    llm_log_dir: str = Field(default="logs", alias="LLM_LOG_DIR")
+    llm_log_truncate_chars: int = Field(default=20000, alias="LLM_LOG_TRUNCATE_CHARS")
     
     # File Upload
     max_file_size_mb: int = Field(default=100, alias="MAX_FILE_SIZE_MB")

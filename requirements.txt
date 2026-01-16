@@ -29,6 +29,7 @@ pydantic-settings==2.7.1
 # Utils
 python-dateutil==2.9.0
 aiofiles==24.1.0
+beautifulsoup4==4.12.3
 
 # Logging
 structlog==24.4.0

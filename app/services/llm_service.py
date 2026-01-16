@@ -2,8 +2,9 @@
 Сервис для работы с Google Gemini LLM.
 """
 
+import json
 import logging
-from typing import Optional, List, Dict, Any, AsyncGenerator
+from typing import Optional, List, Dict, Any, AsyncGenerator, Iterable, Union
 from pathlib import Path
 from uuid import UUID
 
@@ -16,7 +17,8 @@ except ImportError:
 
 from app.config import settings
 from app.db.supabase_client import SupabaseClient
-from app.models.internal import UserWithSettings, LLMResponse, ZoomRequest
+from app.models.internal import UserWithSettings
+from app.models.llm_schemas import get_flash_collector_schema, get_answer_schema
 
 logger = logging.getLogger(__name__)
 
@@ -188,69 +190,147 @@ class LLMService:
         except Exception as e:
             logger.error(f"Error in generate_simple: {e}")
             raise
-    
-    async def generate_complex_flash(
+
+    def _build_generation_config(
         self,
-        user_message: str,
-        document_context: str,
-        supabase: SupabaseClient
-    ) -> Dict[str, Any]:
-        """
-        Первый этап complex режима: Flash собирает контекст.
-        
-        Args:
-            user_message: Сообщение пользователя
-            document_context: Контекст документа
-            supabase: Клиент Supabase
-        
-        Returns:
-            Результат работы Flash (релевантные блоки, запросы изображений/зумов)
-        """
-        # TODO: Реализовать Flash экстрактор
-        # 1. Загрузить flash_extractor промпт
-        # 2. Сформировать запрос с каталогом изображений
-        # 3. Обработать tool calls (request_images, zoom)
-        # 4. Вернуть список релевантных блоков и изображений
-        
-        return {
-            "status": "ready",
-            "relevant_blocks": [],
-            "relevant_images": [],
-            "tool_calls": []
+        system_prompt: str,
+        response_schema: Optional[dict] = None
+    ) -> "genai_types.GenerateContentConfig":
+        """Сформировать конфигурацию генерации с учётом настроек пользователя."""
+        user_settings = self.user.settings
+        temperature = getattr(user_settings, "temperature", None) or settings.llm_temperature
+        top_p = getattr(user_settings, "top_p", None) or settings.llm_top_p
+        thinking_enabled = getattr(user_settings, "thinking_enabled", True)
+        thinking_budget = getattr(user_settings, "thinking_budget", 0)
+        media_resolution = getattr(user_settings, "media_resolution", "high")
+
+        config_params: Dict[str, Any] = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "max_output_tokens": settings.max_tokens,
+            "system_instruction": system_prompt,
         }
-    
-    async def generate_complex_pro(
+
+        if thinking_enabled and hasattr(genai_types, "ThinkingConfig"):
+            config_params["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_budget=thinking_budget if thinking_budget > 0 else None
+            )
+
+        if hasattr(genai_types, "MediaResolution"):
+            media_res_map = {
+                "low": genai_types.MediaResolution.MEDIA_RESOLUTION_LOW,
+                "medium": genai_types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
+                "high": genai_types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+            }
+            if media_resolution in media_res_map:
+                config_params["media_resolution"] = media_res_map[media_resolution]
+
+        if response_schema:
+            config_params["response_mime_type"] = "application/json"
+            config_params["response_schema"] = response_schema
+
+        return genai_types.GenerateContentConfig(**config_params)
+
+    def _build_contents(
         self,
         user_message: str,
-        relevant_context: str,
-        images: List[Dict[str, Any]],
-        supabase: SupabaseClient
-    ) -> AsyncGenerator[str, None]:
-        """
-        Второй этап complex режима: Pro формирует финальный ответ.
-        
-        Args:
-            user_message: Сообщение пользователя
-            relevant_context: Релевантный контекст из Flash
-            images: Изображения и зумы
-            supabase: Клиент Supabase
-        
-        Yields:
-            Токены ответа
-        """
-        # TODO: Реализовать Pro stage
-        # 1. Загрузить системные промпты + роль
-        # 2. Сформировать запрос с релевантным контекстом
-        # 3. Стримить ответ
-        
-        system_prompt = await self.load_system_prompts(supabase)
-        
-        async for token in self.generate_simple(
-            user_message=user_message,
+        google_file_uris: Optional[Iterable[Union[dict, str]]] = None
+    ) -> List["genai_types.Content"]:
+        """Сформировать contents для Gemini."""
+        parts: List[Any] = []
+        if google_file_uris:
+            for uri_item in google_file_uris:
+                if isinstance(uri_item, dict):
+                    uri = uri_item.get("uri", "")
+                    mime = uri_item.get("mime_type") or self._guess_mime_type(uri)
+                else:
+                    uri = uri_item
+                    mime = self._guess_mime_type(uri)
+                if uri:
+                    parts.append(genai_types.Part.from_uri(file_uri=uri, mime_type=mime))
+        parts.append(genai_types.Part(text=user_message))
+        return [genai_types.Content(role="user", parts=parts)]
+
+    async def generate_json_response(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        google_file_uris: Optional[Iterable[Union[dict, str]]] = None,
+        response_schema: Optional[dict] = None,
+        model_name: Optional[str] = None,
+    ) -> str:
+        """Выполнить вызов LLM и вернуть JSON текст."""
+        try:
+            contents = self._build_contents(user_message, google_file_uris)
+            config = self._build_generation_config(system_prompt, response_schema=response_schema)
+            response = self.client.models.generate_content(
+                model=model_name or self.model_name,
+                contents=contents,
+                config=config,
+            )
+            return (response.text or "").strip()
+        except Exception as e:
+            logger.error(f"Error in generate_json_response: {e}")
+            raise
+
+    def parse_json(self, text: str) -> dict:
+        """Попытаться распарсить JSON из ответа LLM."""
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Попытка вырезать JSON-объект из текста
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(text[start:end + 1])
+            raise
+    
+    async def run_flash_collector(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        google_file_uris: Optional[Iterable[Union[dict, str]]] = None,
+        model_name: Optional[str] = None,
+        return_text: bool = False,
+    ) -> Union[dict, tuple[dict, str]]:
+        """Запуск Flash-collector (строгий JSON)."""
+        text = await self.generate_json_response(
             system_prompt=system_prompt,
-            images=images
-        ):
-            yield token
+            user_message=user_message,
+            google_file_uris=google_file_uris,
+            response_schema=get_flash_collector_schema(),
+            model_name=model_name,
+        )
+        parsed = self.parse_json(text)
+        if return_text:
+            return parsed, text
+        return parsed
+
+    async def run_answer(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        google_file_uris: Optional[Iterable[Union[dict, str]]] = None,
+        model_name: Optional[str] = None,
+        return_text: bool = False,
+    ) -> Union[dict, tuple[dict, str]]:
+        """Запуск ответа (Flash или Pro) со строгим JSON."""
+        text = await self.generate_json_response(
+            system_prompt=system_prompt,
+            user_message=user_message,
+            google_file_uris=google_file_uris,
+            response_schema=get_answer_schema(),
+            model_name=model_name,
+        )
+        parsed = self.parse_json(text)
+        if return_text:
+            return parsed, text
+        return parsed
     
     def _guess_mime_type(self, uri: str) -> str:
         """Определить MIME тип по расширению в URI."""

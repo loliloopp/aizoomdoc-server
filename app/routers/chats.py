@@ -269,6 +269,8 @@ async def chat_stream_sse(
     chat_id: UUID,
     client_id: Optional[str] = Query(default=None, description="ID клиента (projects)"),
     document_ids: Optional[List[UUID]] = Query(default=None, description="ID документов для контекста"),
+    compare_document_ids_a: Optional[List[UUID]] = Query(default=None, description="ID документов для сравнения (A)"),
+    compare_document_ids_b: Optional[List[UUID]] = Query(default=None, description="ID документов для сравнения (B)"),
     google_files: Optional[str] = Query(default=None, description="JSON с файлами из Google File API"),
     current_user=Depends(get_current_user),
     supabase: SupabaseClient = Depends(),
@@ -302,6 +304,8 @@ async def chat_stream_sse(
             user_message=last_user_message.content,
             client_id=client_id,
             document_ids=document_ids,
+            compare_document_ids_a=compare_document_ids_a,
+            compare_document_ids_b=compare_document_ids_b,
             google_file_uris=parsed_google_files,
             save_user_message=False
         ):

@@ -230,6 +230,7 @@ class GoogleFileUploadResponse(BaseModel):
     google_file_uri: str
     google_file_name: str
     state: str = "ACTIVE"
+    storage_path: Optional[str] = None
 
 
 class FileInfo(BaseModel):

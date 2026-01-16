@@ -2,26 +2,39 @@
 Сервис агента - оркестратор пайплайна обработки запросов.
 """
 
+import json
 import logging
-import re
 import os
+import re
 from typing import Optional, AsyncGenerator, Dict, Any, List
 from pathlib import Path
+from uuid import UUID
+from datetime import datetime
 from io import BytesIO
 
 import fitz  # PyMuPDF
 from PIL import Image
-from uuid import UUID
-from datetime import datetime
 
-from app.models.internal import UserWithSettings, SearchResult, LLMResponse
+from app.config import settings
+from app.models.internal import UserWithSettings, SearchResult
 from app.models.api import StreamEvent, PhaseStartedEvent, PhaseProgressEvent, LLMTokenEvent, ToolCallEvent
+from app.models.llm_schemas import (
+    AnswerResponse,
+    FlashCollectorResponse,
+    SelectedBlock,
+    ImageRequest,
+    ROIRequest,
+    MaterialsJSON,
+    MaterialImage,
+)
 from app.db.supabase_client import SupabaseClient
 from app.db.supabase_projects_client import SupabaseProjectsClient
 from app.db.s3_client import S3Client
 from app.services.llm_service import create_llm_service
+from app.services.llm_logger import LLMDialogLogger
 from app.services.search_service import SearchService
-from app.services.image_service import ImageService
+from app.services.evidence_service import EvidenceService
+from app.services.html_ocr_service import HtmlOcrService
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +77,8 @@ class AgentService:
         
         # Инициализация сервисов
         self.llm_service = create_llm_service(user)
-        self.search_service = SearchService(projects_db)
-        self.image_service = ImageService(s3_client)
+        self.search_service = SearchService(projects_db, s3_client)
+        self.evidence_service = EvidenceService()
     
     async def process_message(
         self,
@@ -73,6 +86,8 @@ class AgentService:
         user_message: str,
         client_id: Optional[str] = None,
         document_ids: Optional[List[UUID]] = None,
+        compare_document_ids_a: Optional[List[UUID]] = None,
+        compare_document_ids_b: Optional[List[UUID]] = None,
         google_file_uris: Optional[List[str]] = None,
         save_user_message: bool = True
     ) -> AsyncGenerator[StreamEvent, None]:
@@ -96,7 +111,22 @@ class AgentService:
         Yields:
             События стриминга
         """
+        llm_logger: Optional[LLMDialogLogger] = None
         try:
+            llm_logger = LLMDialogLogger(str(chat_id))
+            llm_logger.log_section("USER MESSAGE", user_message)
+            llm_logger.log_section(
+                "REQUEST CONTEXT",
+                {
+                    "client_id": client_id,
+                    "document_ids": [str(x) for x in (document_ids or [])],
+                    "compare_document_ids_a": [str(x) for x in (compare_document_ids_a or [])],
+                    "compare_document_ids_b": [str(x) for x in (compare_document_ids_b or [])],
+                    "google_files": google_file_uris or [],
+                },
+            )
+            if self._has_html_files(google_file_uris):
+                llm_logger.log_line("HTML attachment detected (text/html).")
             # Сохраняем сообщение пользователя в БД (если нужно)
             if save_user_message:
                 await self.supabase.add_message(
@@ -106,6 +136,22 @@ class AgentService:
                 )
             
             context_text = ""
+
+            if compare_document_ids_a and compare_document_ids_b:
+                async for event in self._process_compare_mode(
+                    chat_id=chat_id,
+                    user_message=user_message,
+                    document_ids_a=compare_document_ids_a,
+                    document_ids_b=compare_document_ids_b,
+                    llm_logger=llm_logger,
+                ):
+                    yield event
+                yield StreamEvent(
+                    event="completed",
+                    data={"message": "Обработка завершена"},
+                    timestamp=datetime.utcnow()
+                )
+                return
 
             # Фаза 1: Сбор контекста документов (если есть)
             if document_ids:
@@ -143,13 +189,16 @@ class AgentService:
                     context_text,
                     document_ids=document_ids,
                     client_id=client_id,
-                    google_file_uris=google_file_uris
+                    google_file_uris=google_file_uris,
+                    llm_logger=llm_logger,
                 ):
                     yield event
             else:  # complex
                 async for event in self._process_complex_mode(
                     chat_id, user_message, context_text, client_id,
-                    google_file_uris=google_file_uris
+                    document_ids=document_ids,
+                    google_file_uris=google_file_uris,
+                    llm_logger=llm_logger,
                 ):
                     yield event
             
@@ -162,11 +211,354 @@ class AgentService:
         
         except Exception as e:
             logger.error(f"Error in process_message: {e}", exc_info=True)
+            if llm_logger:
+                try:
+                    llm_logger.log_section("ERROR", str(e))
+                except Exception:
+                    pass
             yield StreamEvent(
                 event="error",
                 data={"message": str(e)},
                 timestamp=datetime.utcnow()
             )
+
+    async def _build_document_payloads(self, document_ids: List[UUID]) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        for doc_id in document_ids:
+            node = await self.projects_db.get_node_by_id(doc_id)
+            doc_name = node.get("name") if node else str(doc_id)
+            files = await self.projects_db.get_document_results(doc_id)
+
+            md_text = await self._download_text_file(files, "result_md")
+            html_text = await self._download_text_file(files, "ocr_html")
+            if html_text:
+                html_text = self._normalize_html_text(html_text)
+            full_parts: List[str] = []
+            if md_text:
+                full_parts.append(md_text)
+            if html_text:
+                full_parts.append(html_text)
+            full_text = "\n\n".join(full_parts).strip()
+
+            blocks = self.search_service.parse_md_blocks(md_text or "")
+            block_map = self.search_service.build_block_map(blocks)
+
+            payloads.append(
+                {
+                    "doc_id": str(doc_id),
+                    "doc_name": doc_name,
+                    "full_text": full_text,
+                    "block_map": block_map,
+                    "blocks": blocks,
+                }
+            )
+        return payloads
+
+    async def _download_text_file(self, files: List[dict], file_type: str) -> str:
+        target = next((f for f in files if f.get("file_type") == file_type), None)
+        if not target:
+            return ""
+        key = target.get("r2_key")
+        if not key:
+            return ""
+        data = await self.s3_client.download_bytes(key)
+        if not data:
+            return ""
+        return data.decode("utf-8", errors="ignore")
+
+    async def _build_html_crop_map(self, google_file_uris: Optional[List[Any]]) -> Dict[str, str]:
+        if not google_file_uris:
+            return {}
+        crop_map: Dict[str, str] = {}
+        for item in google_file_uris:
+            if not isinstance(item, dict):
+                continue
+            mime = (item.get("mime_type") or "").lower()
+            storage_path = item.get("storage_path")
+            if "text/html" not in mime or not storage_path:
+                continue
+            data = await self._download_bytes(storage_path)
+            if not data:
+                logger.warning(f"Failed to load HTML from storage_path={storage_path}")
+                continue
+            html_text = data.decode("utf-8", errors="ignore")
+            html_map = HtmlOcrService.extract_image_map(html_text)
+            crop_map.update(html_map)
+        return crop_map
+
+    async def _download_crop_bytes(self, source: str) -> Optional[bytes]:
+        if not source:
+            return None
+        if source.startswith("http://") or source.startswith("https://"):
+            return await self._download_public(source)
+        return await self._download_bytes(source)
+
+    def _is_pdf_bytes(self, data: bytes) -> bool:
+        return data[:4] == b"%PDF"
+
+    def _combine_document_texts(self, payloads: List[Dict[str, Any]]) -> str:
+        parts: List[str] = []
+        for payload in payloads:
+            if payload.get("full_text"):
+                header = f"=== DOCUMENT: {payload.get('doc_name')} ({payload.get('doc_id')}) ==="
+                parts.append(header)
+                parts.append(payload["full_text"])
+        return "\n\n".join(parts).strip()
+
+    def _normalize_html_text(self, html_text: str) -> str:
+        # Basic HTML cleanup for OCR files.
+        cleaned = re.sub(r"<[^>]+>", " ", html_text)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _has_html_files(self, google_file_uris: Optional[List[Any]]) -> bool:
+        if not google_file_uris:
+            return False
+        for item in google_file_uris:
+            if isinstance(item, dict):
+                mime = (item.get("mime_type") or "").lower()
+                uri = (item.get("uri") or "").lower()
+            else:
+                mime = ""
+                uri = str(item).lower()
+            if "text/html" in mime or uri.endswith(".html") or ".html?" in uri:
+                return True
+        return False
+
+    def _compose_system_prompt(self, base_prompt: str, google_file_uris: Optional[List[Any]]) -> str:
+        html_prompt = load_prompt("html_ocr_prompt")
+        if html_prompt and self._has_html_files(google_file_uris):
+            return f"{base_prompt}\n\n{html_prompt}"
+        return base_prompt
+
+    def _html_attachment_note(self, google_file_uris: Optional[List[Any]]) -> str:
+        if self._has_html_files(google_file_uris):
+            return "NOTE: HTML OCR file is attached via Google File API. Use its content as the main text source."
+        return ""
+
+    def _format_materials_prompt(self, materials_json: dict, user_message: str) -> str:
+        return (
+            "MATERIALS_JSON:\n"
+            f"{json.dumps(materials_json, ensure_ascii=False)}\n\n"
+            f"USER QUESTION:\n{user_message}"
+        )
+
+    def _apply_coverage_check(
+        self,
+        flash_response: FlashCollectorResponse,
+        block_map: Dict[str, Any],
+        query: str,
+        max_add: int = 10,
+    ) -> FlashCollectorResponse:
+        selected_ids = {b.block_id for b in flash_response.selected_blocks}
+        linked_ids = self.search_service.find_linked_blocks(selected_ids, block_map)
+        preferred_pages = {b.page_number for b in flash_response.selected_blocks if b.page_number}
+
+        all_blocks = list(block_map.values())
+        extra_blocks = self.search_service.suggest_additional_blocks(
+            blocks=all_blocks,
+            selected_ids=selected_ids | linked_ids,
+            query=query,
+            preferred_pages=preferred_pages,
+            max_add=max_add,
+        )
+
+        new_blocks: Dict[str, SelectedBlock] = {b.block_id: b for b in flash_response.selected_blocks}
+
+        def add_block_from_map(block_id: str) -> None:
+            if block_id in new_blocks:
+                return
+            block = block_map.get(block_id)
+            if not block:
+                return
+            new_blocks[block_id] = SelectedBlock(
+                block_id=block.block_id,
+                block_kind=block.block_kind,
+                page_number=max(1, block.page_number),
+                content_raw=block.content_raw,
+                linked_block_ids=block.linked_block_ids,
+            )
+
+        for block_id in linked_ids:
+            add_block_from_map(block_id)
+        for block in extra_blocks:
+            add_block_from_map(block.block_id)
+
+        requested_images = {r.block_id for r in flash_response.requested_images}
+        for block in new_blocks.values():
+            if block.block_kind == "IMAGE" and block.block_id not in requested_images:
+                flash_response.requested_images.append(
+                    ImageRequest(block_id=block.block_id, reason="coverage-check", priority="medium")
+                )
+                requested_images.add(block.block_id)
+
+        flash_response.selected_blocks = list(new_blocks.values())
+        return flash_response
+
+    async def _build_materials(
+        self,
+        *,
+        document_ids: List[UUID],
+        selected_blocks: List[SelectedBlock],
+        requested_images: List[ImageRequest],
+        requested_rois: List[ROIRequest],
+        block_map: Dict[str, Any],
+        existing_materials: Optional[dict] = None,
+        llm_logger: Optional[LLMDialogLogger] = None,
+        html_crop_map: Optional[Dict[str, str]] = None,
+    ) -> tuple[dict, List[dict]]:
+        blocks_by_id: Dict[str, SelectedBlock] = {b.block_id: b for b in selected_blocks}
+        for req in requested_images:
+            if req.block_id in blocks_by_id:
+                continue
+            parsed = block_map.get(req.block_id)
+            if parsed:
+                blocks_by_id[req.block_id] = SelectedBlock(
+                    block_id=parsed.block_id,
+                    block_kind=parsed.block_kind,
+                    page_number=parsed.page_number,
+                    content_raw=parsed.content_raw,
+                    linked_block_ids=parsed.linked_block_ids,
+                )
+
+        materials_images: List[MaterialImage] = []
+        google_files: List[dict] = []
+        seen_keys: set[tuple] = set()
+        if existing_materials:
+            try:
+                existing = MaterialsJSON.model_validate(existing_materials)
+                for img in existing.images:
+                    key = (img.block_id, img.kind, tuple(img.bbox_norm) if img.bbox_norm else None)
+                    seen_keys.add(key)
+                    google_files.append({"uri": img.png_uri, "mime_type": "image/png"})
+            except Exception:
+                pass
+
+        async def upload_render(block_id: str, render) -> Optional[MaterialImage]:
+            key = (block_id, render.kind, tuple(render.bbox_norm) if render.bbox_norm else None)
+            if key in seen_keys:
+                return None
+            seen_keys.add(key)
+            file_name = f"{block_id}_{render.kind}"
+            google_file = await self._upload_png_to_google(render.png_bytes, file_name)
+            if not google_file:
+                return None
+            google_files.append(google_file)
+            if llm_logger:
+                llm_logger.log_section(
+                    "UPLOAD_PNG",
+                    {
+                        "block_id": block_id,
+                        "kind": render.kind,
+                        "bbox_norm": render.bbox_norm,
+                        "uri": google_file.get("uri"),
+                    },
+                )
+            return MaterialImage(
+                block_id=block_id,
+                kind=render.kind,
+                png_uri=google_file["uri"],
+                width=render.width,
+                height=render.height,
+                scale_factor=render.scale_factor,
+                bbox_norm=render.bbox_norm,
+            )
+
+        for req in requested_images:
+            crop = await self._find_crop_by_image_id(req.block_id, document_ids)
+            pdf_bytes = None
+            cache_key = None
+            if crop:
+                r2_key = crop.get("r2_key")
+                if r2_key:
+                    pdf_bytes = await self.s3_client.download_bytes(r2_key)
+                    cache_key = r2_key
+            if not pdf_bytes and html_crop_map:
+                crop_url = html_crop_map.get(req.block_id)
+                if crop_url:
+                    pdf_bytes = await self._download_crop_bytes(crop_url)
+                    cache_key = crop_url
+                    if llm_logger:
+                        llm_logger.log_section(
+                            "HTML_CROP_MAP",
+                            {"block_id": req.block_id, "crop_url": crop_url},
+                        )
+
+            if not pdf_bytes:
+                logger.warning(f"Crop not found for image_id: {req.block_id}")
+                if llm_logger:
+                    llm_logger.log_section("MISSING_CROP", {"block_id": req.block_id})
+                continue
+            if not self._is_pdf_bytes(pdf_bytes):
+                logger.warning(f"Non-PDF crop for image_id: {req.block_id}")
+                if llm_logger:
+                    llm_logger.log_section("NON_PDF_CROP", {"block_id": req.block_id})
+                continue
+
+            renders = self.evidence_service.build_preview_and_quadrants(
+                pdf_bytes, cache_key=cache_key or req.block_id, page=0, dpi=150
+            )
+            for render in renders:
+                material = await upload_render(req.block_id, render)
+                if material:
+                    materials_images.append(material)
+
+        for roi in requested_rois:
+            crop = await self._find_crop_by_image_id(roi.block_id, document_ids)
+            pdf_bytes = None
+            cache_key = None
+            if crop:
+                r2_key = crop.get("r2_key")
+                if r2_key:
+                    pdf_bytes = await self.s3_client.download_bytes(r2_key)
+                    cache_key = r2_key
+            if not pdf_bytes and html_crop_map:
+                crop_url = html_crop_map.get(roi.block_id)
+                if crop_url:
+                    pdf_bytes = await self._download_crop_bytes(crop_url)
+                    cache_key = crop_url
+                    if llm_logger:
+                        llm_logger.log_section(
+                            "HTML_CROP_MAP",
+                            {"block_id": roi.block_id, "crop_url": crop_url},
+                        )
+
+            if not pdf_bytes:
+                logger.warning(f"Crop not found for ROI: {roi.block_id}")
+                if llm_logger:
+                    llm_logger.log_section("MISSING_CROP", {"block_id": roi.block_id})
+                continue
+            if not self._is_pdf_bytes(pdf_bytes):
+                logger.warning(f"Non-PDF crop for ROI: {roi.block_id}")
+                if llm_logger:
+                    llm_logger.log_section("NON_PDF_CROP", {"block_id": roi.block_id})
+                continue
+            # Crop PDFs are single-page extracts, always use page 0
+            # (roi.page refers to the original document page, not the crop)
+            page_index = 0
+            dpi = roi.dpi or 300
+            if dpi < 72:
+                dpi = 72
+            if dpi > 400:
+                dpi = 400
+            render = self.evidence_service.build_roi(
+                pdf_bytes, cache_key=cache_key or roi.block_id, bbox_norm=roi.bbox_norm, page=page_index, dpi=dpi
+            )
+            material = await upload_render(roi.block_id, render)
+            if material:
+                materials_images.append(material)
+
+        if existing_materials:
+            existing = MaterialsJSON.model_validate(existing_materials)
+            materials_images = existing.images + materials_images
+            blocks_by_id = {b.block_id: b for b in existing.blocks} | blocks_by_id
+
+        materials = MaterialsJSON(
+            blocks=list(blocks_by_id.values()),
+            images=materials_images,
+            source_documents=[str(doc_id) for doc_id in document_ids],
+        )
+        return materials.model_dump(), google_files
     
     async def _process_simple_mode(
         self,
@@ -175,123 +567,326 @@ class AgentService:
         context_text: str,
         document_ids: Optional[List[UUID]] = None,
         client_id: Optional[str] = None,
-        google_file_uris: Optional[List[str]] = None
+        google_file_uris: Optional[List[str]] = None,
+        llm_logger: Optional[LLMDialogLogger] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
-        """Обработка в simple (flash) режиме с итеративной обработкой tool calls."""
-        
-        # Загружаем системный промпт из файла
-        system_prompt = load_prompt("llm_system_prompt")
+        """Обработка в simple (flash-only) режиме со строгим JSON."""
+
+        system_prompt = load_prompt("flash_answer_prompt") or load_prompt("llm_system_prompt")
         if not system_prompt:
             system_prompt = await self.llm_service.load_system_prompts(self.supabase)
-        
-        # Формируем начальный промпт с контекстом
-        full_message = f"{context_text}\n\nЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_message}"
-        
-        # Файлы для LLM (начальные + полученные через tool calls)
-        current_files = list(google_file_uris) if google_file_uris else []
-        
-        # Максимальное количество итераций tool calls
+        system_prompt = self._compose_system_prompt(system_prompt, google_file_uris)
+
+        payloads = await self._build_document_payloads(document_ids or [])
+        full_context = self._combine_document_texts(payloads) or context_text
+        html_note = self._html_attachment_note(google_file_uris)
+        html_crop_map = await self._build_html_crop_map(google_file_uris)
+        if llm_logger and html_crop_map:
+            llm_logger.log_section("HTML_CROP_MAP_SIZE", {"count": len(html_crop_map)})
+        block_map: Dict[str, Any] = {}
+        for payload in payloads:
+            block_map.update(payload.get("block_map", {}))
+
         max_iterations = 5
         iteration = 0
-        final_response = ""
-        
+        materials_json: Optional[dict] = None
+        google_files: List[dict] = list(google_file_uris) if google_file_uris else []
+        final_answer: Optional[AnswerResponse] = None
+
         while iteration < max_iterations:
             iteration += 1
-            logger.info(f"LLM iteration {iteration}, files: {len(current_files)}")
-            
-            # Стримим ответ
-            accumulated_response = ""
-            
-            async for token in self.llm_service.generate_simple(
-                user_message=full_message,
+            logger.info(f"Flash-only iteration {iteration}")
+            if materials_json:
+                user_prompt = f"{full_context}\n\n{html_note}\n\n{self._format_materials_prompt(materials_json, user_message)}"
+            else:
+                user_prompt = f"{full_context}\n\n{html_note}\n\nUSER QUESTION:\n{user_message}"
+
+            if llm_logger:
+                llm_logger.log_request(
+                    phase=f"simple_answer_{iteration}",
+                    model=settings.default_flash_model or settings.default_model,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    google_files=google_files or [],
+                )
+
+            answer_dict, raw_text = await self.llm_service.run_answer(
                 system_prompt=system_prompt,
-                google_file_uris=current_files if current_files else None
-            ):
-                accumulated_response += token
-                
-                yield StreamEvent(
-                    event="llm_token",
-                    data=LLMTokenEvent(
-                        token=token,
-                        accumulated=accumulated_response
-                    ).dict(),
-                    timestamp=datetime.utcnow()
-                )
-            
-            final_response = accumulated_response
-            
-            # Парсим tool calls
-            tool_calls = await self.llm_service.parse_tool_calls(accumulated_response)
-            
-            if not tool_calls:
-                # Нет tool calls - финальный ответ
-                logger.info("No tool calls, final response")
-                break
-            
-            # Обрабатываем tool calls и собираем новые файлы
-            new_files = []
-            
-            for call in tool_calls:
-                tool = call.get("tool")
-                reason = call.get("reason", "")
-                params = {k: v for k, v in call.items() if k not in ("tool", "reason")}
-                
-                if not tool:
-                    continue
-                
-                yield StreamEvent(
-                    event="tool_call",
-                    data=ToolCallEvent(
-                        tool=tool,
-                        parameters=params,
-                        reason=reason
-                    ).dict(),
-                    timestamp=datetime.utcnow()
-                )
-                
+                user_message=user_prompt,
+                google_file_uris=google_files if google_files else None,
+                model_name=settings.default_flash_model or settings.default_model,
+                return_text=True,
+            )
+            if llm_logger:
+                llm_logger.log_response(phase=f"simple_answer_{iteration}", response_text=raw_text)
+            try:
+                answer = AnswerResponse.model_validate(answer_dict)
+            except Exception as e:
+                logger.error(f"Invalid AnswerResponse: {e}")
+                if llm_logger:
+                    llm_logger.log_section("VALIDATION_ERROR", str(e))
+                raise
+
+            if answer.followup_images or answer.followup_rois:
+                if llm_logger:
+                    llm_logger.log_section(
+                        "FOLLOWUP_REQUESTS",
+                        {
+                            "followup_images": answer.followup_images,
+                            "followup_rois": [r.model_dump() for r in answer.followup_rois],
+                        },
+                    )
+                image_reqs = [ImageRequest(block_id=bid, reason="followup", priority="high") for bid in answer.followup_images]
+                roi_reqs = [ROIRequest.model_validate(r) for r in answer.followup_rois]
+
+                if image_reqs:
+                    yield StreamEvent(
+                        event="tool_call",
+                        data=ToolCallEvent(
+                            tool="request_images",
+                            parameters={"image_ids": [r.block_id for r in image_reqs]},
+                            reason="followup_images"
+                        ).dict(),
+                        timestamp=datetime.utcnow()
+                    )
+                if roi_reqs:
+                    yield StreamEvent(
+                        event="tool_call",
+                        data=ToolCallEvent(
+                            tool="zoom",
+                            parameters={"count": len(roi_reqs)},
+                            reason="followup_rois"
+                        ).dict(),
+                        timestamp=datetime.utcnow()
+                    )
+
                 yield StreamEvent(
                     event="phase_started",
-                    data={"phase": "tool_execution", "description": f"Выполняю {tool}..."},
+                    data={"phase": "tool_execution", "description": "Подготовка PNG изображений..."},
                     timestamp=datetime.utcnow()
                 )
-                
-                if tool == "request_images":
-                    image_ids = params.get("image_ids") or []
-                    files = await self._fetch_and_upload_images(image_ids, document_ids)
-                    new_files.extend(files)
-                    
-                elif tool == "zoom":
-                    image_id = params.get("image_id")
-                    coords = params.get("coords_norm") or params.get("coords_px")
-                    files = await self._fetch_and_upload_zoom(image_id, document_ids, coords)
-                    new_files.extend(files)
-                    
-                elif tool == "request_documents":
-                    doc_names = params.get("documents") or params.get("document_names") or []
-                    # TODO: Загрузить дополнительные документы
-                    logger.info(f"Request documents: {doc_names}")
-            
-            if not new_files:
-                # Tool calls были, но новых файлов нет - выходим
-                logger.info("Tool calls processed but no new files")
-                break
-            
-            # Добавляем новые файлы к текущим
-            current_files.extend(new_files)
-            
-            # Формируем сообщение для следующей итерации
-            full_message = f"Предыдущий ответ: {accumulated_response}\n\nПолучены запрошенные изображения ({len(new_files)} шт). Продолжи анализ.\n\nЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_message}"
-        
-        # Сохраняем финальный ответ в БД
+
+                materials_json, google_files = await self._build_materials(
+                    document_ids=document_ids or [],
+                    selected_blocks=[],
+                    requested_images=image_reqs,
+                    requested_rois=roi_reqs,
+                    block_map=block_map,
+                    existing_materials=materials_json,
+                    llm_logger=llm_logger,
+                    html_crop_map=html_crop_map,
+                )
+                if llm_logger:
+                    llm_logger.log_section("MATERIALS_JSON_UPDATE", materials_json)
+
+                if not google_files:
+                    logger.warning("No PNG files produced for followups")
+                    final_answer = answer
+                    break
+                continue
+
+            final_answer = answer
+            break
+
+        if final_answer is None:
+            raise RuntimeError("Failed to obtain final answer")
+
         await self.supabase.add_message(
             chat_id=chat_id,
             role="assistant",
-            content=final_response
+            content=final_answer.answer_markdown,
         )
-        
+
         yield StreamEvent(
             event="llm_final",
-            data={"content": final_response},
+            data={"content": final_answer.answer_markdown, "answer_json": final_answer.model_dump()},
+            timestamp=datetime.utcnow()
+        )
+
+    async def _process_compare_mode(
+        self,
+        *,
+        chat_id: UUID,
+        user_message: str,
+        document_ids_a: List[UUID],
+        document_ids_b: List[UUID],
+        llm_logger: Optional[LLMDialogLogger] = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Compare two document sets (Flash collector -> Pro answer)."""
+
+        flash_prompt = load_prompt("flash_extractor_prompt")
+        if not flash_prompt:
+            flash_prompt = await self.llm_service.load_system_prompts(self.supabase)
+        flash_prompt = self._compose_system_prompt(flash_prompt, None)
+
+        pro_prompt = load_prompt("pro_answer_prompt") or load_prompt("llm_system_prompt")
+        if not pro_prompt:
+            pro_prompt = await self.llm_service.load_system_prompts(self.supabase)
+        pro_prompt = self._compose_system_prompt(pro_prompt, None)
+
+        payloads_a = await self._build_document_payloads(document_ids_a)
+        payloads_b = await self._build_document_payloads(document_ids_b)
+
+        yield self._create_phase_event("flash_stage", "Flash собирает контекст для сравнения...")
+
+        combined_blocks: List[SelectedBlock] = []
+        combined_images: List[ImageRequest] = []
+        combined_rois: List[ROIRequest] = []
+
+        def label_block(block: SelectedBlock, label: str) -> SelectedBlock:
+            return SelectedBlock(
+                block_id=block.block_id,
+                block_kind=block.block_kind,
+                page_number=max(1, block.page_number),
+                content_raw=f"[{label}]\n{block.content_raw}",
+                linked_block_ids=block.linked_block_ids,
+            )
+
+        block_map: Dict[str, Any] = {}
+
+        async def collect(payloads: List[Dict[str, Any]], label_prefix: str) -> None:
+            for payload in payloads:
+                full_text = payload.get("full_text") or ""
+                user_prompt = f"{full_text}\n\nUSER QUESTION:\n{user_message}"
+                if llm_logger:
+                    llm_logger.log_request(
+                        phase=f"flash_collect_{label_prefix}_{payload.get('doc_id')}",
+                        model=settings.default_flash_model or settings.default_model,
+                        system_prompt=flash_prompt,
+                        user_prompt=user_prompt,
+                        google_files=[],
+                    )
+                flash_dict, raw_text = await self.llm_service.run_flash_collector(
+                    system_prompt=flash_prompt,
+                    user_message=user_prompt,
+                    model_name=settings.default_flash_model or settings.default_model,
+                    return_text=True,
+                )
+                if llm_logger:
+                    llm_logger.log_response(
+                        phase=f"flash_collect_{label_prefix}_{payload.get('doc_id')}",
+                        response_text=raw_text,
+                    )
+                flash_resp = FlashCollectorResponse.model_validate(flash_dict)
+                flash_resp = self._apply_coverage_check(
+                    flash_response=flash_resp,
+                    block_map=payload.get("block_map", {}),
+                    query=user_message,
+                    max_add=10,
+                )
+                if llm_logger:
+                    llm_logger.log_section(
+                        "COVERAGE_CHECK",
+                        {
+                            "doc_id": payload.get("doc_id"),
+                            "selected_blocks": len(flash_resp.selected_blocks),
+                            "requested_images": len(flash_resp.requested_images),
+                            "requested_rois": len(flash_resp.requested_rois),
+                        },
+                    )
+                label = f"{label_prefix}: {payload.get('doc_name')} ({payload.get('doc_id')})"
+                combined_blocks.extend([label_block(b, label) for b in flash_resp.selected_blocks])
+                combined_images.extend(flash_resp.requested_images)
+                combined_rois.extend(flash_resp.requested_rois)
+
+                for block in payload.get("blocks", []):
+                    block_map[block.block_id] = SelectedBlock(
+                        block_id=block.block_id,
+                        block_kind=block.block_kind,
+                        page_number=max(1, block.page_number),
+                        content_raw=f"[{label}]\n{block.content_raw}",
+                        linked_block_ids=block.linked_block_ids,
+                    )
+
+        await collect(payloads_a, "DOC_A")
+        await collect(payloads_b, "DOC_B")
+
+        yield self._create_progress_event("flash_stage", 1.0, "Контекст собран")
+
+        # Prepare materials
+        yield self._create_phase_event("tool_execution", "Подготовка PNG изображений...")
+        combined_doc_ids = document_ids_a + document_ids_b
+        materials_json, google_files = await self._build_materials(
+            document_ids=combined_doc_ids,
+            selected_blocks=combined_blocks,
+            requested_images=combined_images,
+            requested_rois=combined_rois,
+            block_map=block_map,
+            llm_logger=llm_logger,
+        )
+        if llm_logger:
+            llm_logger.log_section("MATERIALS_JSON", materials_json)
+
+        # Pro answer
+        yield self._create_phase_event("pro_stage", "Pro сравнивает документы...")
+        max_iterations = 5
+        iteration = 0
+        final_answer: Optional[AnswerResponse] = None
+
+        while iteration < max_iterations:
+            iteration += 1
+            compare_question = f"Compare DOC_A vs DOC_B. {user_message}"
+            user_prompt = self._format_materials_prompt(materials_json, compare_question)
+            if llm_logger:
+                llm_logger.log_request(
+                    phase=f"compare_pro_answer_{iteration}",
+                    model=settings.default_pro_model or settings.default_model,
+                    system_prompt=pro_prompt,
+                    user_prompt=user_prompt,
+                    google_files=google_files or [],
+                )
+            answer_dict, raw_text = await self.llm_service.run_answer(
+                system_prompt=pro_prompt,
+                user_message=user_prompt,
+                google_file_uris=google_files if google_files else None,
+                model_name=settings.default_pro_model or settings.default_model,
+                return_text=True,
+            )
+            if llm_logger:
+                llm_logger.log_response(phase=f"compare_pro_answer_{iteration}", response_text=raw_text)
+            answer = AnswerResponse.model_validate(answer_dict)
+
+            if answer.followup_images or answer.followup_rois:
+                if llm_logger:
+                    llm_logger.log_section(
+                        "FOLLOWUP_REQUESTS",
+                        {
+                            "followup_images": answer.followup_images,
+                            "followup_rois": [r.model_dump() for r in answer.followup_rois],
+                        },
+                    )
+                image_reqs = [ImageRequest(block_id=bid, reason="followup", priority="high") for bid in answer.followup_images]
+                roi_reqs = [ROIRequest.model_validate(r) for r in answer.followup_rois]
+
+                yield self._create_phase_event("tool_execution", "Подготовка доп. PNG изображений...")
+                materials_json, google_files = await self._build_materials(
+                    document_ids=combined_doc_ids,
+                    selected_blocks=combined_blocks,
+                    requested_images=image_reqs,
+                    requested_rois=roi_reqs,
+                    block_map=block_map,
+                    existing_materials=materials_json,
+                    llm_logger=llm_logger,
+                )
+                if llm_logger:
+                    llm_logger.log_section("MATERIALS_JSON_UPDATE", materials_json)
+                continue
+
+            final_answer = answer
+            break
+
+        if final_answer is None:
+            raise RuntimeError("Failed to obtain final compare answer")
+
+        await self.supabase.add_message(
+            chat_id=chat_id,
+            role="assistant",
+            content=final_answer.answer_markdown,
+        )
+
+        yield StreamEvent(
+            event="llm_final",
+            data={"content": final_answer.answer_markdown, "answer_json": final_answer.model_dump()},
             timestamp=datetime.utcnow()
         )
     
@@ -300,7 +895,7 @@ class AgentService:
         image_ids: List[str],
         document_ids: Optional[List[UUID]]
     ) -> List[dict]:
-        """Найти изображения по ID и загрузить в Google File API."""
+        """Найти изображения по ID и загрузить PNG в Google File API."""
         uploaded_files = []
         
         for image_id in image_ids:
@@ -319,13 +914,15 @@ class AgentService:
                 if not file_bytes:
                     logger.warning(f"Failed to download: {r2_key}")
                     continue
-                
-                # Загружаем в Google File API
-                mime_type = crop.get("mime_type") or "image/png"
-                google_file = await self._upload_to_google(file_bytes, image_id, mime_type)
-                if google_file:
-                    uploaded_files.append(google_file)
-                    logger.info(f"Uploaded image {image_id} to Google: {google_file.get('uri')}")
+
+                renders = self.evidence_service.build_preview_and_quadrants(
+                    file_bytes, cache_key=r2_key, page=0, dpi=150
+                )
+                for render in renders:
+                    google_file = await self._upload_png_to_google(render.png_bytes, f"{image_id}_{render.kind}")
+                    if google_file:
+                        uploaded_files.append(google_file)
+                        logger.info(f"Uploaded image {image_id} to Google: {google_file.get('uri')}")
                     
             except Exception as e:
                 logger.error(f"Error fetching image {image_id}: {e}")
@@ -338,7 +935,7 @@ class AgentService:
         document_ids: Optional[List[UUID]],
         coords: Optional[List[float]]
     ) -> List[dict]:
-        """Создать zoom и загрузить в Google File API."""
+        """Создать zoom (PNG) и загрузить в Google File API."""
         if not image_id or not coords:
             return []
         
@@ -366,7 +963,7 @@ class AgentService:
             
             # Загружаем в Google
             zoom_name = f"zoom_{image_id}_{coords[0]:.2f}_{coords[1]:.2f}"
-            google_file = await self._upload_to_google(zoom_bytes, zoom_name, "image/png")
+            google_file = await self._upload_png_to_google(zoom_bytes, zoom_name)
             if google_file:
                 logger.info(f"Uploaded zoom to Google: {google_file.get('uri')}")
                 return [google_file]
@@ -408,6 +1005,10 @@ class AgentService:
         except Exception as e:
             logger.error(f"Error uploading to Google: {e}")
             return None
+
+    async def _upload_png_to_google(self, png_bytes: bytes, name: str) -> Optional[dict]:
+        """Upload PNG only to Google File API."""
+        return await self._upload_to_google(png_bytes, name, "image/png")
     
     async def _crop_image(self, file_bytes: bytes, coords: List[float], is_pdf: bool) -> Optional[bytes]:
         """Вырезать область из изображения/PDF."""
@@ -447,59 +1048,213 @@ class AgentService:
         user_message: str,
         context_text: str,
         client_id: str,
-        google_file_uris: Optional[List[str]] = None
+        document_ids: Optional[List[UUID]] = None,
+        google_file_uris: Optional[List[str]] = None,
+        llm_logger: Optional[LLMDialogLogger] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
-        """Обработка в complex (flash+pro) режиме."""
-        
-        # Этап 1: Flash собирает контекст
+        """Обработка в complex (flash+pro) режиме со строгим JSON."""
+
+        flash_prompt = load_prompt("flash_extractor_prompt")
+        if not flash_prompt:
+            flash_prompt = await self.llm_service.load_system_prompts(self.supabase)
+
+        pro_prompt = load_prompt("pro_answer_prompt") or load_prompt("llm_system_prompt")
+        if not pro_prompt:
+            pro_prompt = await self.llm_service.load_system_prompts(self.supabase)
+
+        payloads = await self._build_document_payloads(document_ids or [])
+        block_map: Dict[str, Any] = {}
+        for payload in payloads:
+            block_map.update(payload.get("block_map", {}))
+        html_crop_map = await self._build_html_crop_map(google_file_uris)
+        if llm_logger and html_crop_map:
+            llm_logger.log_section("HTML_CROP_MAP_SIZE", {"count": len(html_crop_map)})
+
+        # Этап 1: Flash collector по каждому документу
         yield self._create_phase_event("flash_stage", "Flash собирает контекст...")
-        
-        flash_result = await self.llm_service.generate_complex_flash(
-            user_message=user_message,
-            document_context=context_text,
-            supabase=self.supabase
-        )
-        
-        # TODO: Обработка tool calls (request_images, zoom)
-        
-        yield self._create_progress_event("flash_stage", 1.0, "Контекст собран")
-        
-        # Этап 2: Pro генерирует ответ
-        yield self._create_phase_event("pro_stage", "Pro формирует ответ...")
-        
-        # Формируем релевантный контекст
-        relevant_context = self._format_relevant_context(flash_result)
-        
-        # Стримим ответ от Pro
-        accumulated_response = ""
-        
-        async for token in self.llm_service.generate_complex_pro(
-            user_message=user_message,
-            relevant_context=relevant_context,
-            images=[],  # TODO: Добавить изображения из flash_result
-            supabase=self.supabase
-        ):
-            accumulated_response += token
-            
-            yield StreamEvent(
-                event="llm_token",
-                data=LLMTokenEvent(
-                    token=token,
-                    accumulated=accumulated_response
-                ).dict(),
-                timestamp=datetime.utcnow()
+
+        combined_blocks: List[SelectedBlock] = []
+        combined_images: List[ImageRequest] = []
+        combined_rois: List[ROIRequest] = []
+        html_note = self._html_attachment_note(google_file_uris)
+
+        if payloads:
+            for payload in payloads:
+                full_text = payload.get("full_text") or ""
+                user_prompt = f"{full_text}\n\n{html_note}\n\nUSER QUESTION:\n{user_message}"
+                if llm_logger:
+                    llm_logger.log_request(
+                        phase=f"flash_collect_{payload.get('doc_id')}",
+                        model=settings.default_flash_model or settings.default_model,
+                        system_prompt=flash_prompt,
+                        user_prompt=user_prompt,
+                        google_files=google_file_uris or [],
+                    )
+                flash_dict, raw_text = await self.llm_service.run_flash_collector(
+                    system_prompt=flash_prompt,
+                    user_message=user_prompt,
+                    google_file_uris=google_file_uris,
+                    model_name=settings.default_flash_model or settings.default_model,
+                    return_text=True,
+                )
+                if llm_logger:
+                    llm_logger.log_response(
+                        phase=f"flash_collect_{payload.get('doc_id')}",
+                        response_text=raw_text,
+                    )
+                flash_resp = FlashCollectorResponse.model_validate(flash_dict)
+                flash_resp = self._apply_coverage_check(
+                    flash_response=flash_resp,
+                    block_map=payload.get("block_map", {}),
+                    query=user_message,
+                    max_add=10,
+                )
+                if llm_logger:
+                    llm_logger.log_section(
+                        "COVERAGE_CHECK",
+                        {
+                            "doc_id": payload.get("doc_id"),
+                            "selected_blocks": len(flash_resp.selected_blocks),
+                            "requested_images": len(flash_resp.requested_images),
+                            "requested_rois": len(flash_resp.requested_rois),
+                        },
+                    )
+                combined_blocks.extend(flash_resp.selected_blocks)
+                combined_images.extend(flash_resp.requested_images)
+                combined_rois.extend(flash_resp.requested_rois)
+        else:
+            # Fallback: use provided context_text
+            user_prompt = f"{context_text}\n\n{html_note}\n\nUSER QUESTION:\n{user_message}"
+            if llm_logger:
+                llm_logger.log_request(
+                    phase="flash_collect_fallback",
+                    model=settings.default_flash_model or settings.default_model,
+                    system_prompt=flash_prompt,
+                    user_prompt=user_prompt,
+                    google_files=google_file_uris or [],
+                )
+            flash_dict, raw_text = await self.llm_service.run_flash_collector(
+                system_prompt=flash_prompt,
+                user_message=user_prompt,
+                google_file_uris=google_file_uris,
+                model_name=settings.default_flash_model or settings.default_model,
+                return_text=True,
             )
-        
-        # Сохраняем ответ в БД
+            if llm_logger:
+                llm_logger.log_response(phase="flash_collect_fallback", response_text=raw_text)
+            flash_resp = FlashCollectorResponse.model_validate(flash_dict)
+            combined_blocks.extend(flash_resp.selected_blocks)
+            combined_images.extend(flash_resp.requested_images)
+            combined_rois.extend(flash_resp.requested_rois)
+
+        yield self._create_progress_event("flash_stage", 1.0, "Контекст собран")
+
+        # Этап 2: подготовка материалов (PNG-only)
+        yield self._create_phase_event("tool_execution", "Подготовка PNG изображений...")
+        materials_json, google_files = await self._build_materials(
+            document_ids=document_ids or [],
+            selected_blocks=combined_blocks,
+            requested_images=combined_images,
+            requested_rois=combined_rois,
+            block_map=block_map,
+            llm_logger=llm_logger,
+            html_crop_map=html_crop_map,
+        )
+        if llm_logger:
+            llm_logger.log_section("MATERIALS_JSON", materials_json)
+
+        # Этап 3: Pro отвечает
+        yield self._create_phase_event("pro_stage", "Pro формирует ответ...")
+        max_iterations = 5
+        iteration = 0
+        final_answer: Optional[AnswerResponse] = None
+
+        while iteration < max_iterations:
+            iteration += 1
+            user_prompt = self._format_materials_prompt(materials_json, user_message)
+            if llm_logger:
+                llm_logger.log_request(
+                    phase=f"pro_answer_{iteration}",
+                    model=settings.default_pro_model or settings.default_model,
+                    system_prompt=pro_prompt,
+                    user_prompt=user_prompt,
+                    google_files=google_files or [],
+                )
+            answer_dict, raw_text = await self.llm_service.run_answer(
+                system_prompt=pro_prompt,
+                user_message=user_prompt,
+                google_file_uris=google_files if google_files else None,
+                model_name=settings.default_pro_model or settings.default_model,
+                return_text=True,
+            )
+            if llm_logger:
+                llm_logger.log_response(phase=f"pro_answer_{iteration}", response_text=raw_text)
+            answer = AnswerResponse.model_validate(answer_dict)
+
+            if answer.followup_images or answer.followup_rois:
+                if llm_logger:
+                    llm_logger.log_section(
+                        "FOLLOWUP_REQUESTS",
+                        {
+                            "followup_images": answer.followup_images,
+                            "followup_rois": [r.model_dump() for r in answer.followup_rois],
+                        },
+                    )
+                image_reqs = [ImageRequest(block_id=bid, reason="followup", priority="high") for bid in answer.followup_images]
+                roi_reqs = [ROIRequest.model_validate(r) for r in answer.followup_rois]
+
+                if image_reqs:
+                    yield StreamEvent(
+                        event="tool_call",
+                        data=ToolCallEvent(
+                            tool="request_images",
+                            parameters={"image_ids": [r.block_id for r in image_reqs]},
+                            reason="followup_images"
+                        ).dict(),
+                        timestamp=datetime.utcnow()
+                    )
+                if roi_reqs:
+                    yield StreamEvent(
+                        event="tool_call",
+                        data=ToolCallEvent(
+                            tool="zoom",
+                            parameters={"count": len(roi_reqs)},
+                            reason="followup_rois"
+                        ).dict(),
+                        timestamp=datetime.utcnow()
+                    )
+
+                yield self._create_phase_event("tool_execution", "Подготовка доп. PNG изображений...")
+
+                materials_json, google_files = await self._build_materials(
+                    document_ids=document_ids or [],
+                    selected_blocks=combined_blocks,
+                    requested_images=image_reqs,
+                    requested_rois=roi_reqs,
+                    block_map=block_map,
+                    existing_materials=materials_json,
+                    llm_logger=llm_logger,
+                    html_crop_map=html_crop_map,
+                )
+                if llm_logger:
+                    llm_logger.log_section("MATERIALS_JSON_UPDATE", materials_json)
+                continue
+
+            final_answer = answer
+            break
+
+        if final_answer is None:
+            raise RuntimeError("Failed to obtain final answer")
+
         await self.supabase.add_message(
             chat_id=chat_id,
             role="assistant",
-            content=accumulated_response
+            content=final_answer.answer_markdown,
         )
-        
+
         yield StreamEvent(
             event="llm_final",
-            data={"content": accumulated_response},
+            data={"content": final_answer.answer_markdown, "answer_json": final_answer.model_dump()},
             timestamp=datetime.utcnow()
         )
     
@@ -567,12 +1322,6 @@ class AgentService:
 
         if not context_parts:
             return ""
-
-        context_parts.append(
-            "Если нужно запросить изображения или дополнительные документы, "
-            "используй tool_call JSON: {\"tool\":\"request_images\",\"image_ids\":[...],\"reason\":\"...\"} "
-            "или {\"tool\":\"request_documents\",\"document_names\":[...],\"reason\":\"...\"}."
-        )
 
         return "\n".join(context_parts)
 

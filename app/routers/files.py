@@ -116,7 +116,8 @@ async def upload_file(
 async def upload_file_for_llm(
     file: UploadFile = File(...),
     user: UserWithSettings = Depends(get_current_user),
-    supabase: SupabaseClient = Depends()
+    supabase: SupabaseClient = Depends(),
+    s3: S3Client = Depends()
 ):
     """
     Загрузить файл через Google File API для использования в LLM.
@@ -177,6 +178,23 @@ async def upload_file_for_llm(
         try:
             # Загружаем в Google File API
             mime_type = file.content_type or "application/octet-stream"
+
+            storage_path = None
+            # Store HTML/MD/TXT locally for later parsing
+            if mime_type in ("text/html", "text/markdown", "text/plain") or (file.filename or "").lower().endswith((".html", ".md", ".txt")):
+                storage_path = s3.generate_key(
+                    user_id=user.user.username,
+                    filename=file.filename,
+                    prefix="llm_uploads"
+                )
+                stored = await s3.upload_bytes(
+                    data=contents,
+                    key=storage_path,
+                    content_type=mime_type
+                )
+                if not stored:
+                    logger.warning("Failed to store LLM file in S3 for parsing")
+                    storage_path = None
             
             # display_name может содержать кириллицу
             display_name = file.filename or "uploaded_file"
@@ -198,7 +216,7 @@ async def upload_file_for_llm(
                 filename=file.filename,
                 mime_type=mime_type,
                 size_bytes=file_size,
-                storage_path=None,
+                storage_path=storage_path,
                 source_type="google_file_api",
                 external_url=uploaded_file.uri
             )
@@ -210,7 +228,8 @@ async def upload_file_for_llm(
                 size_bytes=file_size,
                 google_file_uri=uploaded_file.uri,
                 google_file_name=uploaded_file.name,
-                state=str(uploaded_file.state) if hasattr(uploaded_file, 'state') else "ACTIVE"
+                state=str(uploaded_file.state) if hasattr(uploaded_file, 'state') else "ACTIVE",
+                storage_path=storage_path
             )
             
         finally:
