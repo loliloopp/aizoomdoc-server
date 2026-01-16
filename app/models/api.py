@@ -121,6 +121,10 @@ class MessageCreate(BaseModel):
         default=None,
         description="ID документов из дерева (projects DB)"
     )
+    google_file_uris: Optional[List[str]] = Field(
+        default=None,
+        description="URI файлов из Google File API"
+    )
 
 
 class MessageImage(BaseModel):
@@ -204,6 +208,17 @@ class FileUploadResponse(BaseModel):
     size_bytes: int
     storage_path: str
     created_at: datetime
+
+
+class GoogleFileUploadResponse(BaseModel):
+    """Ответ после загрузки файла в Google File API."""
+    id: Optional[UUID] = None
+    filename: str
+    mime_type: str
+    size_bytes: int
+    google_file_uri: str
+    google_file_name: str
+    state: str = "ACTIVE"
 
 
 class FileInfo(BaseModel):

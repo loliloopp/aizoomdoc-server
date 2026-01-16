@@ -60,6 +60,7 @@ class AgentService:
         user_message: str,
         client_id: Optional[str] = None,
         document_ids: Optional[List[UUID]] = None,
+        google_file_uris: Optional[List[str]] = None,
         save_user_message: bool = True
     ) -> AsyncGenerator[StreamEvent, None]:
         """
@@ -76,6 +77,8 @@ class AgentService:
             chat_id: ID чата
             user_message: Сообщение пользователя
             client_id: ID клиента для поиска документов
+            document_ids: ID документов для контекста
+            google_file_uris: URI файлов из Google File API
         
         Yields:
             События стриминга
@@ -126,12 +129,14 @@ class AgentService:
                     user_message,
                     context_text,
                     document_ids=document_ids,
-                    client_id=client_id
+                    client_id=client_id,
+                    google_file_uris=google_file_uris
                 ):
                     yield event
             else:  # complex
                 async for event in self._process_complex_mode(
-                    chat_id, user_message, context_text, client_id
+                    chat_id, user_message, context_text, client_id,
+                    google_file_uris=google_file_uris
                 ):
                     yield event
             
@@ -156,7 +161,8 @@ class AgentService:
         user_message: str,
         context_text: str,
         document_ids: Optional[List[UUID]] = None,
-        client_id: Optional[str] = None
+        client_id: Optional[str] = None,
+        google_file_uris: Optional[List[str]] = None
     ) -> AsyncGenerator[StreamEvent, None]:
         """Обработка в simple (flash) режиме."""
         
@@ -171,7 +177,8 @@ class AgentService:
         
         async for token in self.llm_service.generate_simple(
             user_message=full_message,
-            system_prompt=system_prompt
+            system_prompt=system_prompt,
+            google_file_uris=google_file_uris
         ):
             accumulated_response += token
             
@@ -245,7 +252,8 @@ class AgentService:
         chat_id: UUID,
         user_message: str,
         context_text: str,
-        client_id: str
+        client_id: str,
+        google_file_uris: Optional[List[str]] = None
     ) -> AsyncGenerator[StreamEvent, None]:
         """Обработка в complex (flash+pro) режиме."""
         

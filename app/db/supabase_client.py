@@ -523,8 +523,9 @@ class SupabaseClient:
         filename: str,
         mime_type: str,
         size_bytes: int,
-        storage_path: str,
-        source_type: str = "user_upload"
+        storage_path: Optional[str],
+        source_type: str = "user_upload",
+        external_url: Optional[str] = None
     ) -> Optional[StorageFile]:
         """Зарегистрировать файл в БД."""
         try:
@@ -538,7 +539,8 @@ class SupabaseClient:
                 "mime_type": mime_type,
                 "size_bytes": size_bytes,
                 "storage_path": storage_path,
-                "source_type": source_type
+                "source_type": source_type,
+                "external_url": external_url
             }
             
             response = self.client.table("storage_files").insert(file_data).execute()

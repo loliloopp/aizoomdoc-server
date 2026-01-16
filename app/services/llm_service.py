@@ -83,7 +83,8 @@ class LLMService:
         self,
         user_message: str,
         system_prompt: str,
-        images: Optional[List[Dict[str, Any]]] = None
+        images: Optional[List[Dict[str, Any]]] = None,
+        google_file_uris: Optional[List[str]] = None
     ) -> AsyncGenerator[str, None]:
         """
         Генерация в simple (flash) режиме со стримингом.
@@ -92,6 +93,7 @@ class LLMService:
             user_message: Сообщение пользователя
             system_prompt: Системный промпт
             images: Список изображений для контекста
+            google_file_uris: URI файлов из Google File API
         
         Yields:
             Токены ответа
@@ -111,6 +113,15 @@ class LLMService:
                 for img_data in images:
                     # TODO: Загрузить изображение и добавить в parts
                     pass
+            
+            # Добавляем файлы из Google File API
+            if google_file_uris:
+                for uri in google_file_uris:
+                    # Используем файловую ссылку через genai_types.FileData
+                    user_parts.append(genai_types.Part.from_uri(
+                        file_uri=uri,
+                        mime_type=self._guess_mime_type(uri)
+                    ))
             
             user_parts.append(genai_types.Part(text=user_message))
             contents.append(
@@ -201,6 +212,32 @@ class LLMService:
             images=images
         ):
             yield token
+    
+    def _guess_mime_type(self, uri: str) -> str:
+        """Определить MIME тип по расширению в URI."""
+        uri_lower = uri.lower()
+        if '.pdf' in uri_lower:
+            return 'application/pdf'
+        elif '.md' in uri_lower:
+            return 'text/markdown'
+        elif '.html' in uri_lower:
+            return 'text/html'
+        elif '.txt' in uri_lower:
+            return 'text/plain'
+        elif '.json' in uri_lower:
+            return 'application/json'
+        elif '.csv' in uri_lower:
+            return 'text/csv'
+        elif '.png' in uri_lower:
+            return 'image/png'
+        elif '.jpg' in uri_lower or '.jpeg' in uri_lower:
+            return 'image/jpeg'
+        elif '.webp' in uri_lower:
+            return 'image/webp'
+        elif '.gif' in uri_lower:
+            return 'image/gif'
+        else:
+            return 'application/octet-stream'
     
     async def parse_tool_calls(self, response_text: str) -> List[Dict[str, Any]]:
         """
